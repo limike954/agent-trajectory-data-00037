@@ -551,11 +551,12 @@ def resolve_all_tasks(
 
     Also handles tag filtering and unique task ID validation.
 
-    Task YAMLs that fail to load (YAML parse error, Pydantic validation,
-    dataset expansion error) are recorded in the returned ``skipped`` list
-    and excluded from the resolved set rather than aborting the suite. The
-    caller surfaces ``skipped`` in the run summary so the failure is loud
-    but recoverable.
+    Task YAMLs that fail during loading, dataset expansion, or variant
+    resolution are recorded in the returned ``skipped`` list and excluded
+    from the resolved set rather than aborting the suite. Resolution is atomic
+    per task file: no generated row, variant, or replicate is retained when
+    another generated entry from that file fails. The caller surfaces
+    ``skipped`` in the run summary so the failure is loud but recoverable.
 
     Args:
         task_files: Paths to task YAML files.
@@ -570,12 +571,15 @@ def resolve_all_tasks(
         Tuple of (resolved tasks ready for run_batch, skipped task records).
 
     Raises:
-        ValueError: If duplicate task IDs are found after resolution.
+        ValueError: If every non-skipped task file fails to resolve, or if
+            duplicate task IDs are found after resolution.
     """
-    from .early_stop import validate_early_stop
+    from .early_stop import EarlyStopConfigError, validate_early_stop
 
     resolved: list[ResolvedTask] = []
     skipped: list[SkippedTask] = []
+    resolution_failures: list[SkippedTask] = []
+    first_value_error: ValueError | None = None
 
     # Resolve variant-level initial_prompt_file paths before the main loop
     exp_dir = experiment_file.parent if experiment_file is not None else None
@@ -589,6 +593,7 @@ def resolve_all_tasks(
             resolve_variant_initial_prompt_file(variant, exp_dir)
 
     for task_file in task_files:
+        file_resolved: list[ResolvedTask] = []
         try:
             task, source_yaml = load_task(task_file)
             # Honor `skip: true` before dataset expansion — quarantined tasks
@@ -612,61 +617,74 @@ def resolve_all_tasks(
                 max_rows=config.max_rows,
                 sample_per_stratum=config.sample_per_stratum,
             )
-        # Narrow set: real load failures only. We deliberately don't catch
-        # AttributeError / TypeError / ImportError — those signal a regression
-        # in load_task / expand_dataset and should crash loudly rather than
-        # silently demote every task to "skipped". Pydantic ValidationError
-        # is a ValueError subclass in v2, so it's covered.
-        except (FileNotFoundError, OSError, ValueError, yaml.YAMLError) as exc:
+
+            for expanded_task in expanded_tasks:
+                for variant in experiment.variants:
+                    # Apply layers 1-4 (default → experiment-defaults → task → variant) + resolve repeats
+                    resolved_task, lineage, effective_repeats = resolve_task_for_variant(
+                        default_experiment, expanded_task, experiment, variant, config
+                    )
+
+                    # Resolve file paths injected by variant overrides
+                    resolve_task_files(resolved_task, task_file, experiment_file)
+
+                    # Apply prompt mutations or overrides (between file resolution and CLI overrides)
+                    _apply_prompt_overrides(resolved_task, experiment, variant, lineage)
+
+                    # Apply layer 5 (CLI overrides)
+                    _apply_cli_overrides(resolved_task, config, lineage)
+
+                    # Early-stop guardrails: run once the task is fully resolved (all 5
+                    # layers merged, incl. -D run_limits.stop_early). No-op unless armed;
+                    # a bad arming remains a hard CLI error rather than skipping the file.
+                    validate_early_stop(resolved_task)
+
+                    # Fan-out: simulation n_trials takes precedence over experiment repeats
+                    # when simulation is active; otherwise use experiment-level repeats.
+                    sim = resolved_task.simulation
+                    n_trials = sim.n_trials if (sim is not None and sim.enabled) else 1
+                    fan_count = n_trials if n_trials > 1 else effective_repeats
+                    for rep in range(fan_count):
+                        file_resolved.append(
+                            ResolvedTask(
+                                task=resolved_task,
+                                task_file=task_file,
+                                run_dir=build_task_run_dir(
+                                    config.run_dir,
+                                    variant.variant_id,
+                                    resolved_task.task_id,
+                                    replicate_index=rep,
+                                ),
+                                variant_id=variant.variant_id,
+                                replicate_index=rep,
+                                source_yaml=source_yaml,
+                                config_lineage=dict(lineage),
+                            )
+                        )
+        except EarlyStopConfigError:
+            raise
+        # Narrow set: expected task-file input/config failures only. We
+        # deliberately don't catch AttributeError / TypeError / ImportError —
+        # those signal a regression and should crash loudly rather than silently
+        # demote the task file to "skipped". Pydantic ValidationError is a
+        # ValueError subclass in v2, so it is covered.
+        except (OSError, ValueError, yaml.YAMLError) as exc:
+            if isinstance(exc, ValueError) and first_value_error is None:
+                first_value_error = exc
             reason = f"{type(exc).__name__}: {exc}"[:500]
             logger.warning("Skipping task file %s — %s", task_file, reason)
-            skipped.append(SkippedTask(path=str(task_file), reason=reason))
+            failure = SkippedTask(path=str(task_file), reason=reason)
+            skipped.append(failure)
+            resolution_failures.append(failure)
             continue
 
-        for expanded_task in expanded_tasks:
-            for variant in experiment.variants:
-                # Apply layers 1-4 (default → experiment-defaults → task → variant) + resolve repeats
-                resolved_task, lineage, effective_repeats = resolve_task_for_variant(
-                    default_experiment, expanded_task, experiment, variant, config
-                )
+        resolved.extend(file_resolved)
 
-                # Resolve file paths injected by variant overrides
-                resolve_task_files(resolved_task, task_file, experiment_file)
-
-                # Apply prompt mutations or overrides (between file resolution and CLI overrides)
-                _apply_prompt_overrides(resolved_task, experiment, variant, lineage)
-
-                # Apply layer 5 (CLI overrides)
-                _apply_cli_overrides(resolved_task, config, lineage)
-
-                # Early-stop guardrails: run once the task is fully resolved (all 5
-                # layers merged, incl. -D run_limits.stop_early). No-op unless armed;
-                # a bad arming raises EarlyStopConfigError (a ValueError) which the
-                # run path converts to a clean CLI error.
-                validate_early_stop(resolved_task)
-
-                # Fan-out: simulation n_trials takes precedence over experiment repeats
-                # when simulation is active; otherwise use experiment-level repeats.
-                sim = resolved_task.simulation
-                n_trials = sim.n_trials if (sim is not None and sim.enabled) else 1
-                fan_count = n_trials if n_trials > 1 else effective_repeats
-                for rep in range(fan_count):
-                    resolved.append(
-                        ResolvedTask(
-                            task=resolved_task,
-                            task_file=task_file,
-                            run_dir=build_task_run_dir(
-                                config.run_dir,
-                                variant.variant_id,
-                                resolved_task.task_id,
-                                replicate_index=rep,
-                            ),
-                            variant_id=variant.variant_id,
-                            replicate_index=rep,
-                            source_yaml=source_yaml,
-                            config_lineage=dict(lineage),
-                        )
-                    )
+    if not resolved and resolution_failures:
+        if first_value_error is not None:
+            raise first_value_error
+        details = "; ".join(f"{failure.path}: {failure.reason}" for failure in resolution_failures)
+        raise ValueError(f"All non-skipped task files failed to resolve: {details}")
 
     # Filter by tags
     if config.include_tags or config.exclude_tags:
